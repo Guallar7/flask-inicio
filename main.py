@@ -1,6 +1,7 @@
 import os
 import logging
 from pathlib import Path
+from flask import Flask, jsonify
 from dotenv import load_dotenv
 
 # Configure logging
