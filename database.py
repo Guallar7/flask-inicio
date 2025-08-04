@@ -1,8 +1,10 @@
 import os
 import logging
+import time
 from pathlib import Path
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, event, exc
 from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.pool import QueuePool
 
 # Set up logging
 logging.basicConfig(
@@ -21,7 +23,8 @@ if not DATABASE_URL:
         from dotenv import load_dotenv
         load_dotenv(dotenv_path=env_path, override=True)
         DATABASE_URL = os.getenv("DATABASE_URL")
-        logger.info("Loaded DATABASE_URL from .env.development")
+        if DATABASE_URL:
+            logger.info("Loaded DATABASE_URL from .env.development")
     
     if not DATABASE_URL:
         error_msg = """
@@ -29,38 +32,80 @@ if not DATABASE_URL:
         Please ensure you have a .env.development file with DATABASE_URL
         or set the DATABASE_URL environment variable.
         """
-        logger.error(error_msg)
-        raise ValueError(error_msg)
+        logger.warning(error_msg)
+        # Don't raise an error here, let the application start without a database
+        # The application will handle the missing database gracefully
+        engine = None
+        Session = None
+else:
+    # Log the first few characters of the DATABASE_URL for debugging
+    db_info = DATABASE_URL.split('@')[-1] if DATABASE_URL else 'not set'
+    logger.info(f"Connecting to database: ***@{db_info}")
 
-# Log the first few characters of the DATABASE_URL for debugging
-# (don't log the full URL as it contains sensitive information)
-db_info = DATABASE_URL.split('@')[-1] if DATABASE_URL else 'not set'
-logger.info(f"Connecting to database: ***@{db_info}")
+    try:
+        # Add connection pool settings
+        pool_size = int(os.getenv('DB_POOL_SIZE', '5'))
+        max_overflow = int(os.getenv('DB_MAX_OVERFLOW', '10'))
+        pool_timeout = int(os.getenv('DB_POOL_TIMEOUT', '30'))
+        pool_recycle = int(os.getenv('DB_POOL_RECYCLE', '3600'))  # Recycle connections after 1 hour
 
-try:
-    # Create database engine
-    engine = create_engine(
-        DATABASE_URL,
-        pool_size=10,
-        max_overflow=0,
-        pool_pre_ping=True  # Enable connection health checks
-    )
+        # Create database engine with connection pooling
+        engine = create_engine(
+            DATABASE_URL,
+            poolclass=QueuePool,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=pool_timeout,
+            pool_recycle=pool_recycle,
+            pool_pre_ping=True,  # Enable connection health checks
+            connect_args={
+                'connect_timeout': 10,  # 10 second connection timeout
+                'options': '-c statement_timeout=30000'  # 30 second statement timeout
+            }
+        )
+
+        # Add event listeners for connection handling
+        @event.listens_for(engine, 'engine_connect')
+        def receive_connection(dbapi_connection, connection_record):
+            logger.debug("Database connection established")
+
+        @event.listens_for(engine, 'checkout')
+        def receive_checkout(dbapi_connection, connection_record, connection_proxy):
+            logger.debug("Checking out database connection from pool")
+
+        # Create session factory with error handling
+        Session = scoped_session(sessionmaker(
+            bind=engine,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False
+        ))
+
+        # Test the connection
+        with engine.connect() as conn:
+            conn.execute("SELECT 1")
+        logger.info("Successfully connected to the database")
+
+    except Exception as e:
+        logger.error(f"Failed to initialize database connection: {str(e)}")
+        logger.warning("Application will start without database connection")
+        engine = None
+        Session = None
     
-    # Create session factory
-    Session = scoped_session(sessionmaker(bind=engine))
-    
-    # Test the connection and log table information
-    with engine.connect() as conn:
-        inspector = inspect(engine)
-        table_names = inspector.get_table_names()
-        logger.info(f"Successfully connected to database. Found {len(table_names)} tables.")
-        
-        if table_names:
-            logger.info("Tables in database:" + "\n- " + "\n- ".join(table_names))
-        else:
-            logger.info("No tables found in the database.")
+        # Test the connection and log table information
+        with engine.connect() as conn:
+            from sqlalchemy import inspect
+            inspector = inspect(engine)
+            table_names = inspector.get_table_names()
+            logger.info(f"Successfully connected to database. Found {len(table_names)} tables.")
             
-except Exception as e:
-    logger.error(f"Error connecting to the database: {str(e)}")
-    logger.error("Please check your DATABASE_URL and ensure the database is accessible.")
-    raise
+            if table_names:
+                logger.info("Tables in database:" + "\n- " + "\n- ".join(table_names))
+            else:
+                logger.info("No tables found in the database.")
+
+    except Exception as e:
+        logger.error(f"Error connecting to the database: {str(e)}")
+        logger.error("Please check your DATABASE_URL and ensure the database is accessible.")
+        engine = None
+        Session = None
