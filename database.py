@@ -2,7 +2,8 @@ import os
 import logging
 import time
 from pathlib import Path
-from sqlalchemy import create_engine, event, exc
+import sqlalchemy
+from sqlalchemy import create_engine, event, exc, text
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.pool import QueuePool
 
@@ -83,7 +84,7 @@ else:
 
         # Test the connection
         with engine.connect() as conn:
-            conn.execute("SELECT 1")
+            conn.execute(sqlalchemy.text("SELECT 1"))
         logger.info("Successfully connected to the database")
 
     except Exception as e:
